@@ -28,6 +28,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("badcat")
 
+debounce: dict[str, float] = {}
+
+def bouncy(inst_name: str) -> bool:
+    now = time.time()
+    if inst_name in debounce and now - debounce[inst_name] < 2.0:
+        return True
+
+    debounce[inst_name] = now
+    return False
+
 # --- Config Manager ---
 class ConfigManager:
     @staticmethod
@@ -35,17 +45,17 @@ class ConfigManager:
         config_path = os.environ.get("INSTANCE_CONFIG_JSON")
         if not config_path:
             raise ValueError("INSTANCE_CONFIG_JSON env var required")
-        
+
         path = Path(config_path)
         if not path.exists():
             raise FileNotFoundError(f"Config not found: {config_path}")
-        
+
         with open(path) as f:
             data = json.load(f)
-        
+
         for k, v in data.items():
             v["name"] = k
-        
+
         return data
 
     @staticmethod
@@ -116,7 +126,7 @@ def load_config(path: Path) -> Optional[dict]:
 def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
     if not lock.acquire(blocking=False):
         return
-    
+
     try:
         indexers = fetch_all_indexers(instance)
         if not indexers:
@@ -151,7 +161,7 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
                 for field in idx.get("fields", []):
                     if field.get("name") in current_cats:
                         field["value"] = current_cats[field["name"]]
-                
+
                 if update_indexer(instance, idx_id, idx):
                     logger.info(f"[{instance['name']}] Synced {raw_name}")
                 else:
@@ -174,7 +184,7 @@ class SignalRHandler:
             .configure_logging(logging.WARNING) \
             .with_automatic_reconnect({"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 180, "max_attempts": 10}) \
             .build()
-        
+
         self.conn.on("receiveMessage", lambda msg: self._trigger(msg))
 
         while self.conn.transport.state.value not in [0, 1, 2]:
@@ -194,9 +204,9 @@ class SignalRHandler:
             msg = msg[0]
         else:
             return
-        
-        if "name" in msg and msg["name"] == "indexer":
-            logger.info(f"[{self.instance['name']}] indexer changed: {msg.get('body', {}).get('resource', {}).get('name')}")
+
+        if "name" in msg and msg["name"] == "indexer" and not bouncy(self.instance["name"]):
+            logger.info(f"[{self.instance['name']}] Indexer changed: {msg.get('body', {}).get('resource', {}).get('name')}")
             threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
 
 class FileHandler(FileSystemEventHandler):
@@ -204,12 +214,11 @@ class FileHandler(FileSystemEventHandler):
         self.instances = instances
         self.output = output
         self.locks = locks
-        self.debounce: dict[str, float] = {}
 
     def on_modified(self, event):
         if event.is_directory or not event.src_path.endswith(".json"):
             return
-        
+
         path = Path(event.src_path)
         try:
             rel = path.relative_to(self.output)
@@ -219,12 +228,10 @@ class FileHandler(FileSystemEventHandler):
 
         if inst_name not in self.instances:
             return
-        
-        now = time.time()
-        if inst_name in self.debounce and now - self.debounce[inst_name] < 2.0:
+
+        if bouncy(inst_name):
             return
-        
-        self.debounce[inst_name] = now
+
         logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
         threading.Thread(target=sync_instance, args=(self.instances[inst_name], self.output, self.locks[inst_name]), daemon=True).start()
 
@@ -241,7 +248,7 @@ class App:
         self.instances = ConfigManager.load_instances()
         self.output = ConfigManager.get_output_folder()
         self.locks = {i: threading.Lock() for i in self.instances.keys()}
-        logger.info(f"Loaded {len(self.instances)} instance(s)")
+        logger.info(f"Loaded {len(self.instances)} arr(s)")
 
     def run(self):
         signal.signal(signal.SIGINT, lambda s, f: self.shutdown.set())
@@ -277,4 +284,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal: {e}")
         sys.exit(1)
-
