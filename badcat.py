@@ -32,7 +32,7 @@ debounce: dict[str, float] = {}
 
 def bouncy(inst_name: str) -> bool:
     now = time.time()
-    if inst_name in debounce and now - debounce[inst_name] < 2.0:
+    if inst_name in debounce and now - debounce[inst_name] < 3.0:
         return True
 
     debounce[inst_name] = now
@@ -144,7 +144,8 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
                 continue
 
             cfg = load_config(path)
-            if not cfg: continue
+            if not cfg:
+                continue
 
             desired = cfg.get("desired_categories", {})
             changed = False
