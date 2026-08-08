@@ -26,6 +26,7 @@ and each subfolder will have one JSON file per indexer that looks like this:
 
 ```json
 {
+  "id": 0,
   "raw_name": "Nyaa.si (Prowlarr)",
   "desired_categories": {
     "categories": [

@@ -28,15 +28,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("badcat")
 
-debounce: dict[str, float] = {}
+queue: dict[str, set[int]] = {}
 
-def bouncy(inst_name: str) -> bool:
-    now = time.time()
-    if inst_name in debounce and now - debounce[inst_name] < 3.0:
-        return True
-
-    debounce[inst_name] = now
-    return False
+def enqueue(lock: threading.Lock, inst_name: str, idx_id: int):
+    with lock:
+        q = queue.get(inst_name, set())
+        q.add(idx_id)
+        queue[inst_name] = q
 
 # --- Config Manager ---
 class ConfigManager:
@@ -69,12 +67,21 @@ def normalize_indexer_name(name: str) -> str:
     first_part = name.split(" ")[0] if " " in name else name
     return re.sub(r"[^\w\-_.]", "", first_part).lower() or "unknown"
 
-def get_headers(api_key: str) -> dict[str, str]:
-    return {"X-Api-Key": api_key, "Content-Type": "application/json"}
+def get_headers(api_key: str, content: str = "Content-Type") -> dict[str, str]:
+    return {"X-Api-Key": api_key, content: "application/json"}
 
 def fetch_all_indexers(instance: dict[str, str]) -> Optional[list[dict]]:
     try:
-        resp = requests.get(f"{instance['url']}/api/v3/indexer", headers=get_headers(instance["api_key"]), timeout=15)
+        resp = requests.get(f"{instance['url']}/api/v3/indexer", headers=get_headers(instance["api_key"], "Accept"), timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[{instance['name']}] Fetch failed: {e}")
+        return None
+
+def fetch_one_indexer(instance: dict[str, str], idx_id: int) -> Optional[dict]:
+    try:
+        resp = requests.get(f"{instance['url']}/api/v3/indexer/{idx_id}", headers=get_headers(instance["api_key"], "Accept"), timeout=5)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -83,7 +90,7 @@ def fetch_all_indexers(instance: dict[str, str]) -> Optional[list[dict]]:
 
 def fetch_available_categories(instance: dict[str, str], indexer_config: dict) -> list[dict]:
     try:
-        resp = requests.post(f"{instance['url']}/api/v3/indexer/action/newznabCategories", json=indexer_config, headers=get_headers(instance["api_key"]), timeout=15)
+        resp = requests.post(f"{instance['url']}/api/v3/indexer/action/newznabCategories", json=indexer_config, headers=get_headers(instance["api_key"]), timeout=5)
         resp.raise_for_status()
         return resp.json()["options"]
     except Exception as e:
@@ -92,11 +99,15 @@ def fetch_available_categories(instance: dict[str, str], indexer_config: dict) -
 
 def update_indexer(instance: dict[str, str], idx_id: int, config: dict) -> bool:
     try:
-        resp = requests.put(f"{instance['url']}/api/v3/indexer/{idx_id}", json=config, headers=get_headers(instance["api_key"]), timeout=15)
+        resp = requests.put(f"{instance['url']}/api/v3/indexer/{idx_id}", json=config, headers=get_headers(instance["api_key"]), timeout=5)
         resp.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"[{instance['name']}] Update failed: {e}")
+        inst_name = instance["name"]
+        logger.error(f"[{inst_name}] Update failed: {e}")
+        q = queue.get(inst_name, set())
+        q.add(idx_id)
+        queue[inst_name] = q
         return False
 
 def extract_categories(indexer: dict) -> dict[str, list[int]]:
@@ -110,8 +121,8 @@ def extract_categories(indexer: dict) -> dict[str, list[int]]:
 def get_json_path(output: Path, inst_name: str, idx_name: str) -> Path:
     return (output / inst_name).mkdir(parents=True, exist_ok=True) or (output / inst_name / f"{normalize_indexer_name(idx_name)}.json")
 
-def save_config(path: Path, raw: str, current: dict, available: list[dict]) -> None:
-    data = {"raw_name": raw, "desired_categories": current, "available_categories": available}
+def save_config(path: Path, idx_id: int, raw_name: str, current: dict, available: list[dict]) -> None:
+    data = {"id": idx_id, "raw_name": raw_name, "desired_categories": current, "available_categories": available}
     path.write_text(json.dumps(data, indent=2))
     logger.info(f"Created config: {path.name}")
 
@@ -127,20 +138,26 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
     if not lock.acquire(blocking=False):
         return
 
+    inst_name = instance["name"]
     try:
-        indexers = fetch_all_indexers(instance)
+        if inst_name in queue and len(queue[inst_name]) == 1:
+            idx_id = next(iter(queue[inst_name]))
+            indexers = [fetch_one_indexer(instance, idx_id)]
+        else:
+            indexers = fetch_all_indexers(instance)
+
         if not indexers:
             return
 
         for idx in indexers:
             raw_name = idx.get("name", "")
             idx_id = idx.get("id")
-            path = get_json_path(output, instance["name"], raw_name)
+            path = get_json_path(output, inst_name, raw_name)
             current_cats = extract_categories(idx)
 
             if not path.exists():
                 avail = fetch_available_categories(instance, idx)
-                save_config(path, raw_name, current_cats, avail)
+                save_config(path, idx_id, raw_name, current_cats, avail)
                 continue
 
             cfg = load_config(path)
@@ -166,8 +183,10 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
                 if update_indexer(instance, idx_id, idx):
                     logger.info(f"[{instance['name']}] Synced {raw_name}")
                 else:
-                    logger.error(f"[{instance['name']}] Failed to sync {raw_name}")
+                    logger.error(f"[{instance['name']}] Failed to sync {raw_name}, will retry")
     finally:
+        if inst_name in queue:
+            del queue[inst_name]
         lock.release()
 
 # --- Event Handlers ---
@@ -206,8 +225,15 @@ class SignalRHandler:
         else:
             return
 
-        if "name" in msg and msg["name"] == "indexer" and not bouncy(self.instance["name"]):
+        if self.instance["name"] in queue:
+            logger.info(f"[{self.instance['name']}] Retrying queued resync")
+            threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
+        elif "name" in msg and msg["name"] == "indexer":
             logger.info(f"[{self.instance['name']}] Indexer changed: {msg.get('body', {}).get('resource', {}).get('name')}")
+
+            if idx_id := msg.get("body", {}).get("resource", {}).get("id"):
+                enqueue(self.lock, self.instance["name"], idx_id)
+
             threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
 
 class FileHandler(FileSystemEventHandler):
@@ -230,10 +256,11 @@ class FileHandler(FileSystemEventHandler):
         if inst_name not in self.instances:
             return
 
-        if bouncy(inst_name):
-            return
 
         logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
+        if idx_id := json.loads(path.read_text()).get("id"):
+            enqueue(sefl.locks[inst_name], inst_name, idx_id)
+
         threading.Thread(target=sync_instance, args=(self.instances[inst_name], self.output, self.locks[inst_name]), daemon=True).start()
 
 # --- Main ---
