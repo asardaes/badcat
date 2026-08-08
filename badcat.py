@@ -136,6 +136,8 @@ def load_config(path: Path) -> Optional[dict]:
 # --- Sync Logic ---
 def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
     if not lock.acquire(blocking=False):
+        if instance["name"] in queue:
+            logger.warning(f"[{instance['name']}] Wanted to sync from queue but could not acquire lock")
         return False
 
     inst_name = instance["name"]
@@ -187,11 +189,13 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
                     logger.error(f"[{instance['name']}] Failed to sync {raw_name}, will retry")
                     failures.append(idx_id)
     finally:
-        if len(failures):
-            queue[inst_name] = set(failures)
-        elif inst_name in queue:
-            del queue[inst_name]
-        lock.release()
+        try:
+            if len(failures):
+                queue[inst_name] = set(failures)
+            elif inst_name in queue:
+                del queue[inst_name]
+        finally:
+            lock.release()
 
     return len(failures) == 0
 
