@@ -228,8 +228,10 @@ class SignalRHandler:
             return
 
         if self.instance["name"] in queue:
-            logger.info(f"[{self.instance['name']}] Retrying queued resync")
-            threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
+            with self.lock:
+                if self.instance["name"] in queue:
+                    logger.info(f"[{self.instance['name']}] Retrying queued resync")
+                    threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
         elif "name" in msg and msg["name"] == "indexer":
             logger.info(f"[{self.instance['name']}] Indexer changed: {msg.get('body', {}).get('resource', {}).get('name')}")
 
@@ -258,6 +260,9 @@ class FileHandler(FileSystemEventHandler):
         if inst_name not in self.instances:
             return
 
+        if inst_name in queue:
+            # some basic debouncing
+            return
 
         logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
         if idx_id := json.loads(path.read_text()).get("id"):
