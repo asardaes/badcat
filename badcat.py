@@ -134,9 +134,9 @@ def load_config(path: Path) -> Optional[dict]:
         return None
 
 # --- Sync Logic ---
-def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
+def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
     if not lock.acquire(blocking=False):
-        return
+        return False
 
     inst_name = instance["name"]
     try:
@@ -147,7 +147,7 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
             indexers = fetch_all_indexers(instance)
 
         if not indexers:
-            return
+            return False
 
         for idx in indexers:
             raw_name = idx.get("name", "")
@@ -188,6 +188,8 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> None:
         if inst_name in queue:
             del queue[inst_name]
         lock.release()
+
+    return True
 
 # --- Event Handlers ---
 class SignalRHandler:
@@ -284,7 +286,8 @@ class App:
 
         # Initial Sync
         for i, inst in self.instances.items():
-            sync_instance(inst, self.output, self.locks[i])
+            while not sync_instance(inst, self.output, self.locks[i]):
+                time.sleep(3)
 
         # Watchdog
         self.observer = Observer()
