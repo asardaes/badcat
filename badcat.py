@@ -4,6 +4,7 @@ Sonarr/Radarr Indexer Category Sync Tool
 Optimized for Python 3.13+
 """
 
+import concurrent.futures
 import os
 import re
 import sys
@@ -13,7 +14,7 @@ import signal
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
 import requests
 from signalrcore.hub_connection_builder import HubConnectionBuilder
@@ -27,14 +28,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("badcat")
-
-queue: dict[str, set[int]] = {}
-
-def enqueue(lock: threading.Lock, inst_name: str, idx_id: int):
-    with lock:
-        q = queue.get(inst_name, set())
-        q.add(idx_id)
-        queue[inst_name] = q
 
 # --- Config Manager ---
 class ConfigManager:
@@ -105,9 +98,6 @@ def update_indexer(instance: dict[str, str], idx_id: int, config: dict) -> bool:
     except Exception as e:
         inst_name = instance["name"]
         logger.error(f"[{inst_name}] Update failed: {e}")
-        q = queue.get(inst_name, set())
-        q.add(idx_id)
-        queue[inst_name] = q
         return False
 
 def extract_categories(indexer: dict) -> dict[str, list[int]]:
@@ -134,77 +124,120 @@ def load_config(path: Path) -> Optional[dict]:
         return None
 
 # --- Sync Logic ---
-def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
-    if not lock.acquire(blocking=False):
-        if instance["name"] in queue:
-            logger.warning(f"[{instance['name']}] Wanted to sync from queue but could not acquire lock")
-        return False
+class SyncManager:
+    def __init__(self, max_workers=3, debounce_seconds=3.0):
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self.debounce_seconds = debounce_seconds
 
-    inst_name = instance["name"]
-    failures: list[int] = []
-    try:
-        if inst_name in queue and len(queue[inst_name]) == 1:
-            idx_id = next(iter(queue[inst_name]))
-            indexers = [fetch_one_indexer(instance, idx_id)]
-        else:
-            indexers = fetch_all_indexers(instance)
+        # State management
+        self.timers: dict[str, threading.Timer] = {}
+        self.pending_ids: dict[str, set[int]] = {}
+        self.lock = threading.Lock()
 
-        if not indexers:
-            return False
+    def request_sync(self, instance: dict, output: Path, idx_id: Optional[int] = None):
+        """Schedules a sync, debouncing rapid sequential calls."""
+        inst_name = instance["name"]
 
-        for idx in indexers:
-            raw_name = idx.get("name", "")
-            idx_id = idx.get("id")
-            path = get_json_path(output, inst_name, raw_name)
-            current_cats = extract_categories(idx)
+        with self.lock:
+            if inst_name not in self.pending_ids:
+                self.pending_ids[inst_name] = set()
+            if idx_id is not None:
+                self.pending_ids[inst_name].add(idx_id)
 
-            if not path.exists():
-                avail = fetch_available_categories(instance, idx)
-                save_config(path, idx_id, raw_name, current_cats, avail)
-                continue
+            # Cancel the existing timer if one is already ticking (Debounce)
+            if inst_name in self.timers:
+                self.timers[inst_name].cancel()
 
-            cfg = load_config(path)
-            if not cfg:
-                continue
+            timer = threading.Timer(
+                self.debounce_seconds,
+                self._dispatch,
+                args=(instance, output)
+            )
+            self.timers[inst_name] = timer
+            timer.start()
 
-            desired = cfg.get("desired_categories", {})
-            changed = False
+    def _dispatch(self, instance: dict, output: Path):
+        """Pulls the pending tasks and submits them to the thread pool."""
+        inst_name = instance["name"]
 
-            for key in ["categories", "animeCategories"]:
-                curr_set = set(current_cats[key])
-                des_set = set(desired.get(key, []))
-                if curr_set != des_set:
-                    logger.info(f"[{instance['name']}] Mismatch {raw_name} ({key}): {curr_set} -> {des_set}")
-                    current_cats[key] = desired.get(key, [])
-                    changed = True
+        with self.lock:
+            ids_to_process = self.pending_ids.pop(inst_name, set())
+            if inst_name in self.timers:
+                del self.timers[inst_name]
 
-            if changed:
-                for field in idx.get("fields", []):
-                    if field.get("name") in current_cats:
-                        field["value"] = current_cats[field["name"]]
+        # Hand off the blocking work to the ThreadPool
+        self.executor.submit(self.run_sync, instance, output, ids_to_process)
 
-                if update_indexer(instance, idx_id, idx):
-                    logger.info(f"[{instance['name']}] Synced {raw_name}")
-                else:
-                    logger.error(f"[{instance['name']}] Failed to sync {raw_name}, will retry")
-                    failures.append(idx_id)
-    finally:
+    def run_sync(self, instance: dict, output: Path, ids_to_process: set[int], retry: bool = True) -> bool:
+        """The actual blocking sync execution."""
+        failures: list[int] = []
         try:
-            if len(failures):
-                queue[inst_name] = set(failures)
-            elif inst_name in queue:
-                del queue[inst_name]
-        finally:
-            lock.release()
+            inst_name = instance["name"]
+            logger.info(f"[{inst_name}] Starting background sync (Targets: {ids_to_process or 'All'})")
+            if len(ids_to_process) == 1:
+                idx_id = next(iter(ids_to_process))
+                indexers = [fetch_one_indexer(instance, idx_id)]
+            else:
+                indexers = fetch_all_indexers(instance)
 
-    return len(failures) == 0
+            if not indexers:
+                return False
+
+            for idx in indexers:
+                raw_name = idx.get("name", "")
+                idx_id = idx.get("id")
+                path = get_json_path(output, inst_name, raw_name)
+                current_cats = extract_categories(idx)
+
+                if not path.exists():
+                    avail = fetch_available_categories(instance, idx)
+                    save_config(path, idx_id, raw_name, current_cats, avail)
+                    continue
+
+                cfg = load_config(path)
+                if not cfg:
+                    continue
+
+                desired = cfg.get("desired_categories", {})
+                changed = False
+
+                for key in ["categories", "animeCategories"]:
+                    curr_set = set(current_cats[key])
+                    des_set = set(desired.get(key, []))
+                    if curr_set != des_set:
+                        logger.info(f"[{instance['name']}] Mismatch {raw_name} ({key}): {curr_set} -> {des_set}")
+                        current_cats[key] = desired.get(key, [])
+                        changed = True
+
+                if changed:
+                    for field in idx.get("fields", []):
+                        if field.get("name") in current_cats:
+                            field["value"] = current_cats[field["name"]]
+
+                    if update_indexer(instance, idx_id, idx):
+                        logger.info(f"[{instance['name']}] Synced {raw_name}")
+                    else:
+                        logger.error(f"[{instance['name']}] Failed to sync {raw_name}, will retry")
+                        failures.append(idx_id)
+
+        except Exception as e:
+            logger.error(f"[{inst_name}] Sync failed: {e}")
+            return False
+        finally:
+            if retry:
+                if len(failures) == 1:
+                    self.request_sync(instance, output, failures[0])
+                else:
+                    self.request_sync(instance, output)
+
+        return True
 
 # --- Event Handlers ---
 class SignalRHandler:
-    def __init__(self, instance: dict, output: Path, lock: threading.Lock):
+    def __init__(self, instance: dict, output: Path, sync_manager: SyncManager):
         self.instance = instance
         self.output = output
-        self.lock = lock
+        self.sync_manager = sync_manager
         self.conn = None
 
     def start(self):
@@ -235,24 +268,16 @@ class SignalRHandler:
         else:
             return
 
-        if self.instance["name"] in queue:
-            with self.lock:
-                if self.instance["name"] in queue:
-                    logger.info(f"[{self.instance['name']}] Retrying queued resync")
-                    threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
-        elif "name" in msg and msg["name"] == "indexer":
+        if "name" in msg and msg["name"] == "indexer":
             logger.info(f"[{self.instance['name']}] Indexer changed: {msg.get('body', {}).get('resource', {}).get('name')}")
-
-            if idx_id := msg.get("body", {}).get("resource", {}).get("id"):
-                enqueue(self.lock, self.instance["name"], idx_id)
-
-            threading.Thread(target=sync_instance, args=(self.instance, self.output, self.lock), daemon=True).start()
+            idx_id = msg.get("body", {}).get("resource", {}).get("id")
+            self.sync_manager.request_sync(self.instance, self.output, idx_id)
 
 class FileHandler(FileSystemEventHandler):
-    def __init__(self, instances: dict, output: Path, locks: dict):
+    def __init__(self, instances: dict, output: Path, sync_manager: SyncManager):
         self.instances = instances
         self.output = output
-        self.locks = locks
+        self.sync_manager = sync_manager
 
     def on_modified(self, event):
         if event.is_directory or not event.src_path.endswith(".json"):
@@ -265,32 +290,23 @@ class FileHandler(FileSystemEventHandler):
         except ValueError:
             return
 
-        if inst_name not in self.instances:
-            return
-
-        if inst_name in queue:
-            # some basic debouncing
-            return
-
-        logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
-        if idx_id := json.loads(path.read_text()).get("id"):
-            enqueue(self.locks[inst_name], inst_name, idx_id)
-
-        threading.Thread(target=sync_instance, args=(self.instances[inst_name], self.output, self.locks[inst_name]), daemon=True).start()
+        if inst_name in self.instances:
+            try:
+                logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
+                idx_id = json.loads(path.read_text()).get("id")
+                self.sync_manager.request_sync(self.instances[inst_name], self.output, idx_id)
+            except Exception as e:
+                logger.error(f"[{inst_name}] Error while trying to request sync: {e}")
 
 # --- Main ---
 class App:
     def __init__(self):
         self.shutdown = threading.Event()
-        self.instances: dict = {}
-        self.output: Path = Path()
-        self.locks: dict[str, threading.Lock] = {}
+        self.instances: dict = ConfigManager.load_instances()
+        self.output: Path = ConfigManager.get_output_folder()
         self.handlers: list[SignalRHandler] = []
         self.observer = None
 
-        self.instances = ConfigManager.load_instances()
-        self.output = ConfigManager.get_output_folder()
-        self.locks = {i: threading.Lock() for i in self.instances.keys()}
         logger.info(f"Loaded {len(self.instances)} arr(s)")
 
     def run(self):
@@ -298,18 +314,19 @@ class App:
         signal.signal(signal.SIGTERM, lambda s, f: self.shutdown.set())
 
         # Initial Sync
-        for i, inst in self.instances.items():
-            while not sync_instance(inst, self.output, self.locks[i]):
+        sync_manager = SyncManager()
+        for inst in self.instances.values():
+            while not sync_manager.run_sync(inst, self.output, set(), False):
                 time.sleep(3)
 
         # Watchdog
         self.observer = Observer()
-        self.observer.schedule(FileHandler(self.instances, self.output, self.locks), str(self.output), recursive=True)
+        self.observer.schedule(FileHandler(self.instances, self.output, sync_manager), str(self.output), recursive=True)
         self.observer.start()
 
         # SignalR
         for i, inst in self.instances.items():
-            h = SignalRHandler(inst, self.output, self.locks[i])
+            h = SignalRHandler(inst, self.output, sync_manager)
             h.start()
             self.handlers.append(h)
 
