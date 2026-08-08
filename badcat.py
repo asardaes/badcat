@@ -139,6 +139,7 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
         return False
 
     inst_name = instance["name"]
+    failures: list[int] = []
     try:
         if inst_name in queue and len(queue[inst_name]) == 1:
             idx_id = next(iter(queue[inst_name]))
@@ -184,12 +185,15 @@ def sync_instance(instance: dict, output: Path, lock: threading.Lock) -> bool:
                     logger.info(f"[{instance['name']}] Synced {raw_name}")
                 else:
                     logger.error(f"[{instance['name']}] Failed to sync {raw_name}, will retry")
+                    failures.append(idx_id)
     finally:
-        if inst_name in queue:
+        if len(failures):
+            queue[inst_name] = set(failures)
+        elif inst_name in queue:
             del queue[inst_name]
         lock.release()
 
-    return True
+    return len(failures) == 0
 
 # --- Event Handlers ---
 class SignalRHandler:
