@@ -312,8 +312,8 @@ class FileHandler(FileSystemEventHandler):
 
     def _cleanup(self, src_path: str):
         with self.lock:
-            if event.src_path in self.queue:
-                self.queue.remove(event.src_path)
+            if src_path in self.queue:
+                self.queue.remove(src_path)
                 time.sleep(1)
 
 # --- Main ---
