@@ -29,6 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("badcat")
 
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
 # --- Config Manager ---
 class ConfigManager:
     @staticmethod
@@ -125,9 +127,8 @@ def load_config(path: Path) -> Optional[dict]:
 
 # --- Sync Logic ---
 class SyncManager:
-    def __init__(self, max_workers=3, debounce_seconds=3.0):
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self.debounce_seconds = debounce_seconds
+    def __init__(self, throttle_seconds=3.0):
+        self.throttle_seconds = throttle_seconds
 
         # State management
         self.timers: dict[str, threading.Timer] = {}
@@ -144,12 +145,12 @@ class SyncManager:
             if idx_id is not None:
                 self.pending_ids[inst_name].add(idx_id)
 
-            # Debounce
+            # Throttle
             if inst_name in self.timers:
                 return False
 
             timer = threading.Timer(
-                self.debounce_seconds,
+                self.throttle_seconds,
                 self._dispatch,
                 args=(instance, output)
             )
@@ -168,7 +169,7 @@ class SyncManager:
                 del self.timers[inst_name]
 
         # Hand off the blocking work to the ThreadPool
-        self.executor.submit(self.run_sync, instance, output, ids_to_process)
+        executor.submit(self.run_sync, instance, output, ids_to_process)
 
     def run_sync(self, instance: dict, output: Path, ids_to_process: set[int], retry: bool = True) -> bool:
         """The actual blocking sync execution."""
@@ -308,13 +309,12 @@ class FileHandler(FileSystemEventHandler):
             except Exception as e:
                 logger.error(f"[{inst_name}] Error while trying to request sync: {e}")
             finally:
-                self._cleanup(event.src_path)
+                executor.submit(self._cleanup, event.src_path)
 
     def _cleanup(self, src_path: str):
+        time.sleep(1.5)
         with self.lock:
-            if src_path in self.queue:
-                self.queue.remove(src_path)
-                time.sleep(1)
+            self.queue.remove(src_path)
 
 # --- Main ---
 class App:
