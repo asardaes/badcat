@@ -134,7 +134,7 @@ class SyncManager:
         self.pending_ids: dict[str, set[int]] = {}
         self.lock = threading.Lock()
 
-    def request_sync(self, instance: dict, output: Path, idx_id: Optional[int] = None):
+    def request_sync(self, instance: dict, output: Path, idx_id: Optional[int] = None) -> bool:
         """Schedules a sync, debouncing rapid sequential calls."""
         inst_name = instance["name"]
 
@@ -144,9 +144,9 @@ class SyncManager:
             if idx_id is not None:
                 self.pending_ids[inst_name].add(idx_id)
 
-            # Cancel the existing timer if one is already ticking (Debounce)
+            # Debounce
             if inst_name in self.timers:
-                self.timers[inst_name].cancel()
+                return False
 
             timer = threading.Timer(
                 self.debounce_seconds,
@@ -155,6 +155,8 @@ class SyncManager:
             )
             self.timers[inst_name] = timer
             timer.start()
+
+        return True
 
     def _dispatch(self, instance: dict, output: Path):
         """Pulls the pending tasks and submits them to the thread pool."""
@@ -224,7 +226,7 @@ class SyncManager:
             logger.error(f"[{inst_name}] Sync failed: {e}")
             return False
         finally:
-            if retry:
+            if failures and retry:
                 if len(failures) == 1:
                     self.request_sync(instance, output, failures[0])
                 else:
@@ -278,6 +280,8 @@ class FileHandler(FileSystemEventHandler):
         self.instances = instances
         self.output = output
         self.sync_manager = sync_manager
+        self.lock = threading.Lock()
+        self.queue: set[str] = set()
 
     def on_modified(self, event):
         if event.is_directory or not event.src_path.endswith(".json"):
@@ -285,10 +289,16 @@ class FileHandler(FileSystemEventHandler):
 
         path = Path(event.src_path)
         try:
+            with self.lock:
+                if event.src_path in self.queue:
+                    return
+                else:
+                    self.queue.add(event.src_path)
+
             rel = path.relative_to(self.output)
             inst_name = rel.parts[0]
-        except ValueError:
-            return
+        except Exception as e:
+            logger.error(f"[{event.src_path}] Error while trying to request sync: {e}")
 
         if inst_name in self.instances:
             try:
@@ -297,6 +307,14 @@ class FileHandler(FileSystemEventHandler):
                 self.sync_manager.request_sync(self.instances[inst_name], self.output, idx_id)
             except Exception as e:
                 logger.error(f"[{inst_name}] Error while trying to request sync: {e}")
+            finally:
+                self._cleanup(event.src_path)
+
+    def _cleanup(self, src_path: str):
+        with self.lock:
+            if event.src_path in self.queue:
+                self.queue.remove(event.src_path)
+                time.sleep(1)
 
 # --- Main ---
 class App:
