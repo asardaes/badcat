@@ -259,7 +259,7 @@ class FileHandler(FileSystemEventHandler):
 
         logger.info(f"Edit detected: {path.name}, syncing {inst_name}")
         if idx_id := json.loads(path.read_text()).get("id"):
-            enqueue(sefl.locks[inst_name], inst_name, idx_id)
+            enqueue(self.locks[inst_name], inst_name, idx_id)
 
         threading.Thread(target=sync_instance, args=(self.instances[inst_name], self.output, self.locks[inst_name]), daemon=True).start()
 
