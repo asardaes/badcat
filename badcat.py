@@ -140,14 +140,14 @@ class SyncManager:
         inst_name = instance["name"]
 
         with self.lock:
-            # Throttle
-            if inst_name in self.timers:
-                return False
-
             if inst_name not in self.pending_ids:
                 self.pending_ids[inst_name] = set()
             if idx_id is not None:
                 self.pending_ids[inst_name].add(idx_id)
+
+            # Throttle
+            if inst_name in self.timers:
+                return False
 
             timer = threading.Timer(
                 self.throttle_seconds,
