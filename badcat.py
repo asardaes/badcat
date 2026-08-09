@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("badcat")
 
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv("THREAD_POOL_SIZE", "5")))
 
 # --- Config Manager ---
 class ConfigManager:
@@ -127,7 +127,7 @@ def load_config(path: Path) -> Optional[dict]:
 
 # --- Sync Logic ---
 class SyncManager:
-    def __init__(self, throttle_seconds=3.0):
+    def __init__(self, throttle_seconds=10.0):
         self.throttle_seconds = throttle_seconds
 
         # State management
@@ -140,14 +140,14 @@ class SyncManager:
         inst_name = instance["name"]
 
         with self.lock:
+            # Throttle
+            if inst_name in self.timers:
+                return False
+
             if inst_name not in self.pending_ids:
                 self.pending_ids[inst_name] = set()
             if idx_id is not None:
                 self.pending_ids[inst_name].add(idx_id)
-
-            # Throttle
-            if inst_name in self.timers:
-                return False
 
             timer = threading.Timer(
                 self.throttle_seconds,
@@ -266,6 +266,11 @@ class SignalRHandler:
             self.conn.stop()
 
     def _trigger(self, msg):
+        """An indexer-modification event may be caused by our update(s),
+        so throttle time should be somewhat large to ensure we don't loop ourselves infinitely.
+        This also means we'll pretty much always do 2 sync runs even if only 1 indexer changes,
+        but we'll call it a feature (we validate our change was applied).
+        """
         if isinstance(msg, list) and len(msg):
             msg = msg[0]
         else:
@@ -332,7 +337,7 @@ class App:
         signal.signal(signal.SIGTERM, lambda s, f: self.shutdown.set())
 
         # Initial Sync
-        sync_manager = SyncManager()
+        sync_manager = SyncManager(throttle_seconds=float(os.getenv("THROTTLE_SECONDS", "10.0")))
         for inst in self.instances.values():
             while not sync_manager.run_sync(inst, self.output, set(), False):
                 time.sleep(3)
@@ -352,9 +357,17 @@ class App:
         self.shutdown.wait()
 
         # Cleanup
+        executor.shutdown(wait=False, cancel_futures=True)
         self.observer.stop()
-        self.observer.join(timeout=5)
-        for h in self.handlers: h.stop()
+        for h in self.handlers:
+            h.stop()
+
+        self.observer.join(timeout=3)
+        try:
+            executor.shutdown()  # now wait
+        except:
+            pass
+
         logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
